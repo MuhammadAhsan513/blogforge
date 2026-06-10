@@ -1,0 +1,24 @@
+# Core LangGraph + LangChain
+langgraph>=0.3
+langchain>=0.3
+langchain-core>=0.3
+langchain-groq>=0.2
+langchain-community>=0.3
+
+# LLM provider key format: Groq (gsk_...)
+# Web search tool (no API key required)
+ddgs>=6.0
+
+# UI
+streamlit>=1.35
+
+# Structured output / validation
+pydantic>=2
+
+# Config
+python-dotenv>=1.0
+
+# Notebook + flowchart rendering (run agent.ipynb)
+jupyter>=1.0
+ipykernel>=6.0
+nbformat>=5.0

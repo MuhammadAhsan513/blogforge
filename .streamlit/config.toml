@@ -1,0 +1,17 @@
+[theme]
+base = "light"
+primaryColor = "#6d5efc"
+backgroundColor = "#f5f6fb"
+secondaryBackgroundColor = "#ffffff"
+textColor = "#1b1f2a"
+font = "sans serif"
+
+[browser]
+gatherUsageStats = false
+
+[server]
+# Disable the auto-reload file watcher. On systems where the inotify watch
+# limit is exhausted it throws "OSError: [Errno 28] inotify watch limit reached"
+# on every rerun, which breaks the app's generate flow. We don't need hot-reload.
+fileWatcherType = "none"
+runOnSave = false

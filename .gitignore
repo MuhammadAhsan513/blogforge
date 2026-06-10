@@ -1,0 +1,20 @@
+# Secrets — never commit the real key
+.env
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Notebook
+.ipynb_checkpoints/
+
+# Outputs / local artifacts
+*.log
+outputs/
