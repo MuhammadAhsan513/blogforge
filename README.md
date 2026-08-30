@@ -1,6 +1,6 @@
 # 📝 BlogForge — LangGraph AI Blog Writer
 
-> QAU LangGraph Group Project. An autonomous AI agent that turns a single topic into
+> An autonomous AI agent that turns a single topic into
 > a polished, SEO-optimized blog post — researching, drafting, self-evaluating with a
 > retry loop, and pausing for human review before publishing.
 
