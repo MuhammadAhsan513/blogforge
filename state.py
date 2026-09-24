@@ -28,3 +28,11 @@ class BlogState(TypedDict, total=False):
     thread_id: str
     final_markdown: str     # published post (set by publish_node)
     final_json: str         # full state snapshot as JSON (set by publish_node)
+
+    # Plan-derived workflow limits (see config/plans.py), seeded by app.py
+    # on the initial run so graph.py's conditional routing can honor the
+    # active usage tier. Never holds provider/model/api_key — those stay
+    # in config["configurable"] and are never persisted to state.
+    plan: str                # "free" | "paid"
+    max_drafts: int
+    quality_threshold: int

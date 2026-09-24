@@ -59,7 +59,7 @@ def draft_prompt(topic: str, research: dict, outline: dict,
     ]
 
 
-def seo_prompt(topic: str, draft: dict):
+def seo_prompt(topic: str, draft: dict, max_body_chars: int = 1800):
     body = "\n\n".join(draft.get("sections", []))
     return [
         ("system",
@@ -68,12 +68,12 @@ def seo_prompt(topic: str, draft: dict):
         ("human",
          f"Topic: {topic}\n"
          f"Title: {draft.get('title', topic)}\n\n"
-         f"Post body:\n{body[:1800]}\n\n"
+         f"Post body:\n{body[:max_body_chars]}\n\n"
          "Produce 6-10 SEO keywords, a meta description, and a URL slug."),
     ]
 
 
-def quality_prompt(topic: str, draft: dict, seo_report: dict):
+def quality_prompt(topic: str, draft: dict, seo_report: dict, max_body_chars: int = 2200):
     body = "\n\n".join(draft.get("sections", []))
     return [
         ("system",
@@ -85,6 +85,6 @@ def quality_prompt(topic: str, draft: dict, seo_report: dict):
          f"Word count: {draft.get('word_count', 'unknown')}\n"
          f"SEO analysis: score={seo_report.get('seo_score')}, "
          f"recommendations={seo_report.get('recommendations')}\n\n"
-         f"Post:\n{body[:2200]}\n\n"
+         f"Post:\n{body[:max_body_chars]}\n\n"
          "Give an overall score and specific, actionable feedback."),
     ]

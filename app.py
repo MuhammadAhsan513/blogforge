@@ -7,6 +7,7 @@ checkpoint survives Streamlit reruns; the active thread_id lives in session_stat
 A small phase state-machine (idle -> review -> done) drives the UI around the
 graph's interrupt() human-review checkpoint. Visual layer lives in ui.py.
 """
+import logging
 import os
 import uuid
 
@@ -16,8 +17,13 @@ from langgraph.types import Command
 
 import ui
 from graph import build_graph
+from config.models import list_providers, list_models
+from config.plans import get_plan_config
+from providers.errors import BlogForgeLLMError
 
 load_dotenv()
+
+logger = logging.getLogger("blogforge")
 
 st.set_page_config(page_title="BlogForge — AI Blog Writer", page_icon="📝", layout="wide")
 st.markdown(ui.inject_css(), unsafe_allow_html=True)
@@ -27,6 +33,34 @@ EXAMPLES = [
     "How to start composting at home",
     "Remote work productivity tips for 2025",
 ]
+
+PROVIDER_LABELS = {
+    "anthropic": "Anthropic",
+    "openai": "OpenAI",
+    "groq": "Groq (free tier)",
+}
+PROVIDER_KEY_HELP = {
+    "anthropic": "From console.anthropic.com/settings/keys. Used only for this session.",
+    "openai": "From platform.openai.com/api-keys. Used only for this session.",
+    "groq": "Free key from console.groq.com/keys. Used only for this session.",
+}
+# Optional server/dev fallbacks (.env) — the sidebar field below is
+# pre-filled from these if present, but a user's own typed key always
+# takes priority once they edit the field.
+ENV_KEY_VARS = {
+    "anthropic": "ANTHROPIC_API_KEY",
+    "openai": "OPENAI_API_KEY",
+    "groq": "GROQ_API_KEY",
+}
+ENV_MODEL_VARS = {
+    "anthropic": "ANTHROPIC_MODEL",
+    "openai": "OPENAI_MODEL",
+    "groq": "GROQ_MODEL",
+}
+
+
+def _provider_label(provider: str) -> str:
+    return PROVIDER_LABELS.get(provider, provider.title())
 
 
 # --------------------------------------------------------------------------- #
@@ -43,24 +77,35 @@ def _init_state():
     ss.setdefault("thread_id", str(uuid.uuid4()))
     ss.setdefault("phase", "idle")          # idle | review | done
     ss.setdefault("error", "")
+    ss.setdefault("error_retryable", False)
     ss.setdefault("topic_input", "")
 
 
 def _config():
-    return {"configurable": {"thread_id": st.session_state.thread_id}}
+    sel = st.session_state.get("_selection", {})
+    return {
+        "configurable": {
+            "thread_id": st.session_state.thread_id,
+            "provider": sel.get("provider"),
+            "model": sel.get("model"),
+            "api_key": sel.get("api_key"),
+            "plan": sel.get("tier"),
+        }
+    }
 
 
 def _reset_session():
     st.session_state.thread_id = str(uuid.uuid4())
     st.session_state.phase = "idle"
     st.session_state.error = ""
+    st.session_state.error_retryable = False
     st.session_state.topic_input = ""
 
 
 # --------------------------------------------------------------------------- #
 # Graph driving (with live animated stepper)
 # --------------------------------------------------------------------------- #
-def _stream(graph_input):
+def _stream(graph_input, revision_context: str | None = None):
     graph = get_graph()
     st.session_state.error = ""
 
@@ -69,6 +114,7 @@ def _stream(graph_input):
         track = st.empty()
         caption = st.empty()
         done = set()
+        revision_count = None
         track.markdown(ui.stepper(done, ui.STEPS[0][0]), unsafe_allow_html=True)
         try:
             for chunk in graph.stream(graph_input, _config(), stream_mode="updates"):
@@ -77,26 +123,58 @@ def _stream(graph_input):
                         track.markdown(ui.stepper(done, "human_review"), unsafe_allow_html=True)
                         caption.caption("⏸️ Paused for your review")
                         continue
+
+                    if node == "draft":
+                        revision_count = update.get("revision_count", revision_count)
+                    is_repeat_draft = node == "draft" and node in done
+                    is_human_edit_draft = (
+                        node == "draft" and node not in done and revision_context == "human_edit"
+                    )
+
                     done.add(node)
                     nxt = ui.NEXT.get(node)
                     track.markdown(ui.stepper(done, nxt), unsafe_allow_html=True)
                     label = dict((k, l) for k, l, _ in ui.STEPS).get(node, node)
-                    extra = f" — scored {update.get('quality_score')}/100" if node == "quality_check" else ""
-                    caption.caption(f"✓ {label} complete{extra}")
+
+                    if is_repeat_draft:
+                        text = ui.revision_caption("quality", revision_count)
+                    elif is_human_edit_draft:
+                        text = ui.revision_caption("human_edit", revision_count)
+                    else:
+                        extra = (
+                            f" — scored {update.get('quality_score')}/100"
+                            if node == "quality_check" else ""
+                        )
+                        text = f"✓ {label} complete{extra}"
+
+                    next_text = None
+                    if node == "quality_check":
+                        sel = st.session_state.get("_selection", {})
+                        plan = get_plan_config(sel.get("tier"))
+                        will_revise = (
+                            update.get("quality_score", 0) < plan.quality_threshold
+                            and (revision_count or 0) < plan.max_drafts
+                        )
+                        next_text = (
+                            "Revising the draft based on the quality check…"
+                            if will_revise else "Preparing for your review…"
+                        )
+                    elif node != "publish":
+                        next_text = ui.PROGRESS_LABEL.get(nxt)
+
+                    caption.caption(f"{text} · {next_text}" if next_text else text)
             snap = graph.get_state(_config())
             st.session_state.phase = "review" if snap.next else "done"
-        except Exception as exc:  # surface key/quota/network errors gracefully
-            msg = str(exc)
-            low = msg.lower()
-            if "rate_limit" in low or "429" in low or "tokens per day" in low:
-                st.session_state.error = (
-                    "RATE_LIMIT::Groq's free-tier token limit was hit for this model. "
-                    "Switch the model to **llama-3.1-8b-instant** in the sidebar (it has a "
-                    "higher free daily limit), or wait for the quota to reset.\n\n"
-                    f"Details: {msg}"
-                )
-            else:
-                st.session_state.error = msg
+        except BlogForgeLLMError as exc:  # normalized, user-safe LLM/provider errors
+            logger.error("LLM error during graph run: %s", exc.technical_detail)
+            st.session_state.error = exc.user_message
+            st.session_state.error_retryable = exc.retryable
+        except Exception:  # anything else: never leak a raw traceback to the UI
+            logger.exception("Unexpected error during graph run")
+            st.session_state.error = (
+                "Something went wrong while generating your post. Please try again."
+            )
+            st.session_state.error_retryable = False
     st.rerun()
 
 
@@ -114,52 +192,80 @@ def _render_post_card(draft: dict):
 # --------------------------------------------------------------------------- #
 def sidebar():
     with st.sidebar:
-        st.markdown('<div class="bf-side-title">⚙️ Settings</div>', unsafe_allow_html=True)
-        st.write("")
-        key = st.text_input(
-            "Groq API key",
-            value=os.getenv("GROQ_API_KEY", ""),
-            type="password",
-            help="Free key at console.groq.com/keys. Used only for this session.",
-        )
-        if key:
-            os.environ["GROQ_API_KEY"] = key.strip()
-
-        model = st.selectbox(
-            "Model",
-            ["llama-3.3-70b-versatile", "openai/gpt-oss-20b", "llama-3.1-8b-instant"],
-            index=0,
-            help="If you hit a daily rate limit on one model, switch to another — "
-                 "each model has its own free-tier quota. 70B gives the best writing; "
-                 "gpt-oss-20b is a reliable alternative; 8b-instant is fastest but has a "
-                 "tight per-minute limit.",
-        )
-        os.environ["GROQ_MODEL"] = model
-
-        st.markdown(
-            f'<div class="bf-kw"><span>thread: {st.session_state.thread_id[:8]}</span>'
-            f'<span>phase: {st.session_state.phase}</span></div>',
-            unsafe_allow_html=True,
-        )
-
-        if st.button("🔄 Reset session", use_container_width=True):
+        st.markdown(ui.sidebar_brand(), unsafe_allow_html=True)
+        if st.button("+ New blog post", type="primary", use_container_width=True):
             _reset_session()
             st.rerun()
 
         st.divider()
-        st.markdown(
-            "**Workflow** · Iterative + Conditional\n\n"
-            "`research → outline → draft → seo → quality_check → review → publish`"
+        st.markdown('<div class="bf-side-title">⚙️ AI configuration</div>', unsafe_allow_html=True)
+        st.write("")
+
+        provider = st.selectbox(
+            "AI provider",
+            list_providers(),
+            format_func=_provider_label,
+            key="provider_select",
         )
+
+        models = list_models(provider=provider)
+        env_model_id = os.getenv(ENV_MODEL_VARS.get(provider, ""), "")
+        default_index = next(
+            (i for i, m in enumerate(models) if m.model_id == env_model_id), 0
+        )
+        model_info = st.selectbox(
+            "Model",
+            models,
+            index=default_index,
+            format_func=lambda m: m.display_name,
+            help="Model options and their free/paid tier come from the central model "
+            "registry (config/models.py).",
+            # Keyed per-provider so switching providers never leaves a stale
+            # selection from another provider's model list.
+            key=f"model_select_{provider}",
+        )
+
+        api_key = st.text_input(
+            f"{_provider_label(provider)} API key",
+            value=os.getenv(ENV_KEY_VARS.get(provider, ""), ""),
+            type="password",
+            help=PROVIDER_KEY_HELP.get(provider, "Used only for this session."),
+            key=f"api_key_input_{provider}",
+        )
+
+        plan = get_plan_config(model_info.tier)
+        st.markdown(
+            ui.usage_panel(model_info.tier, plan, model_info.display_name),
+            unsafe_allow_html=True,
+        )
+
+        st.markdown(f"**Workflow** · {ui.workflow_summary()}")
         st.caption("Self-corrects on low quality · pauses for human approval.")
-        return key
+
+        with st.expander("Session info"):
+            st.markdown(
+                f'<div class="bf-kw"><span>thread: {st.session_state.thread_id[:8]}</span>'
+                f'<span>phase: {st.session_state.phase}</span></div>',
+                unsafe_allow_html=True,
+            )
+
+        selection = {
+            "provider": provider,
+            "model": model_info.model_id,
+            "api_key": (api_key or "").strip(),
+            "tier": model_info.tier,
+        }
+        st.session_state["_selection"] = selection
+        return selection
 
 
 # --------------------------------------------------------------------------- #
 # Phases
 # --------------------------------------------------------------------------- #
-def phase_idle(key):
+def phase_idle(selection):
     st.markdown(ui.hero(), unsafe_allow_html=True)
+
+    api_key = selection.get("api_key")
 
     with st.container(border=True):
         topic = st.text_input(
@@ -168,13 +274,21 @@ def phase_idle(key):
             placeholder="e.g. The benefits of intermittent fasting for beginners",
             label_visibility="collapsed",
         )
-        disabled = not (key and topic.strip())
+        disabled = not (api_key and topic.strip())
         if st.button("🚀 Generate blog post", type="primary",
                      disabled=disabled, use_container_width=True):
-            _stream({"topic": topic.strip(), "revision_count": 0})
+            plan = get_plan_config(selection.get("tier", "paid"))
+            _stream({
+                "topic": topic.strip(),
+                "revision_count": 0,
+                "plan": selection.get("tier"),
+                "max_drafts": plan.max_drafts,
+                "quality_threshold": plan.quality_threshold,
+            })
 
-        if not key:
-            st.info("Add your Groq API key in the sidebar to begin.", icon="🔑")
+        if not api_key:
+            label = _provider_label(selection.get("provider", ""))
+            st.info(f"Add your {label} API key in the sidebar to begin.", icon="🔑")
         else:
             st.caption("Try an example:")
             cols = st.columns(len(EXAMPLES))
@@ -190,7 +304,7 @@ def phase_review():
     draft = vals.get("draft", {})
     seo = vals.get("seo_output", {})
 
-    st.markdown(ui.section("Human review checkpoint", "👀"), unsafe_allow_html=True)
+    st.markdown(ui.section("This article is ready for your review", "👀"), unsafe_allow_html=True)
     st.markdown(ui.stepper({"research", "outline", "draft", "seo", "quality_check"},
                            "human_review"), unsafe_allow_html=True)
     st.markdown(
@@ -198,11 +312,17 @@ def phase_review():
                    draft.get("word_count"), seo.get("report", {}).get("seo_score")),
         unsafe_allow_html=True,
     )
-    st.markdown(ui.keyword_tags(seo.get("keywords", [])), unsafe_allow_html=True)
+
+    with st.container(border=True):
+        st.markdown(ui.section("SEO details", "🚀"), unsafe_allow_html=True)
+        st.markdown(ui.seo_card(seo), unsafe_allow_html=True)
 
     if vals.get("quality_feedback"):
         with st.expander("🧠 Reviewer feedback from the quality check"):
-            st.write(vals["quality_feedback"])
+            st.markdown(
+                ui.quality_feedback_card(vals.get("quality_score"), vals["quality_feedback"]),
+                unsafe_allow_html=True,
+            )
 
     _render_post_card(draft)
 
@@ -220,7 +340,8 @@ def phase_review():
                 fb = st.text_area("Feedback", placeholder="e.g. Add a section on common mistakes.",
                                   label_visibility="collapsed")
                 if st.form_submit_button("✏️ Request edit", use_container_width=True):
-                    _stream(Command(resume={"action": "edit", "feedback": fb}))
+                    _stream(Command(resume={"action": "edit", "feedback": fb}),
+                            revision_context="human_edit")
 
 
 def phase_done():
@@ -236,9 +357,14 @@ def phase_done():
                    draft.get("word_count"), seo.get("report", {}).get("seo_score")),
         unsafe_allow_html=True,
     )
-    st.markdown(ui.keyword_tags(seo.get("keywords", [])), unsafe_allow_html=True)
+    with st.container(border=True):
+        st.markdown(ui.section("SEO details", "🚀"), unsafe_allow_html=True)
+        st.markdown(ui.seo_card(seo), unsafe_allow_html=True)
 
     _render_post_card(draft)
+
+    with st.expander("📋 View / copy markdown"):
+        st.code(vals.get("final_markdown", ""), language="markdown")
 
     slug = seo.get("slug", "blog-post")
     c1, c2, c3 = st.columns(3)
@@ -259,20 +385,19 @@ def phase_done():
 # --------------------------------------------------------------------------- #
 def main():
     _init_state()
-    key = sidebar()
+    selection = sidebar()
 
     st.markdown(ui.topbar(), unsafe_allow_html=True)
 
     if st.session_state.error:
-        err = st.session_state.error
-        if err.startswith("RATE_LIMIT::"):
-            st.warning(err.replace("RATE_LIMIT::", ""), icon="⏳")
+        if st.session_state.error_retryable:
+            st.warning(st.session_state.error, icon="⏳")
         else:
-            st.error(f"Something went wrong: {err}", icon="⚠️")
+            st.error(st.session_state.error, icon="⚠️")
 
     phase = st.session_state.phase
     if phase == "idle":
-        phase_idle(key)
+        phase_idle(selection)
     elif phase == "review":
         phase_review()
     elif phase == "done":

@@ -18,6 +18,20 @@ STEPS = [
 ]
 NEXT = {k: STEPS[i + 1][0] for i, (k, _, _) in enumerate(STEPS[:-1])}
 
+# Present-progressive copy shown while the *next* stage is actually running,
+# right after the previous stage's update arrives (stream_mode="updates"
+# only yields on completion, so this is the most truthful "in progress" cue
+# available without fabricating percentages/timings).
+PROGRESS_LABEL = {
+    "research": "Researching your topic…",
+    "outline": "Building the article outline…",
+    "draft": "Writing the draft…",
+    "seo": "Optimizing content for search engines…",
+    "quality_check": "Running the quality check…",
+    "human_review": "Waiting for your review…",
+    "publish": "Publishing your post…",
+}
+
 
 def inject_css() -> str:
     return """
@@ -136,6 +150,44 @@ section[data-testid="stSidebar"] .bf-side-title { font-weight:800; font-size:1.0
 
 /* footer note */
 .bf-foot { text-align:center; color:#9aa0ad; font-size:.78rem; margin-top:2rem; }
+
+/* ---- sidebar brand ---- */
+.bf-brand-side { font-size:1rem; margin-bottom:.8rem; }
+.bf-brand-side .bf-logo { width:28px; height:28px; font-size:.95rem; }
+
+/* ---- usage panel ---- */
+.bf-usage { background:#fbfaff; border:1px solid var(--bf-line); border-radius:12px;
+  padding:.7rem .85rem; margin:.3rem 0 .8rem; display:flex; flex-direction:column; gap:.35rem; }
+.bf-usage-row { display:flex; justify-content:space-between; align-items:center;
+  font-size:.82rem; color:var(--bf-muted); }
+.bf-usage-row b { color:var(--bf-ink); font-weight:700; }
+
+/* ---- SEO card ---- */
+.bf-seo-row { margin:.6rem 0 .4rem; }
+.bf-seo-label { font-size:.72rem; font-weight:700; text-transform:uppercase; letter-spacing:.04em;
+  color:var(--bf-muted); margin-top:.6rem; }
+.bf-seo-meta { color:var(--bf-ink); font-size:.92rem; margin-top:.15rem; }
+.bf-slug { font-size:.82rem; background:#f1f0fb; color:#5a4fd0; border:1px solid #e6e3fb;
+  padding:.2rem .5rem; border-radius:6px; }
+.bf-reco { margin:.6rem 0 0; padding-left:1.1rem; color:var(--bf-ink); font-size:.9rem; }
+.bf-reco li { margin:.2rem 0; }
+
+/* ---- quality feedback card ---- */
+.bf-quality-fb { background:#fbfaff; border:1px solid var(--bf-line); border-radius:12px;
+  padding:.8rem .95rem; }
+.bf-quality-fb-head { margin-bottom:.5rem; }
+.bf-quality-fb-body { color:var(--bf-ink); font-size:.92rem; line-height:1.5; }
+
+/* ---- responsive ---- */
+@media (max-width: 900px) {
+  .bf-metrics { grid-template-columns:repeat(2,1fr); }
+  .bf-stepper { overflow-x:auto; justify-content:flex-start; gap:.35rem; padding-bottom:.4rem; }
+  .bf-step { flex:0 0 auto; }
+}
+@media (max-width: 560px) {
+  .bf-metrics { grid-template-columns:1fr 1fr; gap:.5rem; }
+  .bf-hero h1 { font-size:2.1rem; }
+}
 </style>
 """
 
@@ -144,7 +196,7 @@ def topbar() -> str:
     return """
 <div class="bf-topbar">
   <div class="bf-brand"><span class="bf-logo">📝</span> BlogForge</div>
-  <span class="bf-tag">⚡ Groq · LangGraph</span>
+  <span class="bf-tag">⚡ Multi-Provider · LangGraph</span>
 </div>
 """
 
@@ -187,6 +239,14 @@ def stepper(done: set, active: str | None = None) -> str:
     return f'<div class="bf-stepper">{"".join(parts)}</div>'
 
 
+def revision_caption(reason: str, attempt) -> str:
+    """Caption shown when the draft node runs again — distinguishes *why*."""
+    n = f" (attempt {attempt})" if attempt else ""
+    if reason == "human_edit":
+        return f"✏️ Redrafting based on your feedback…{n}"
+    return f"🔁 Quality check flagged room to improve — writing a revised draft…{n}"
+
+
 def _grade(score):
     if score is None:
         return "", "—"
@@ -201,6 +261,17 @@ def quality_pill(score) -> str:
     cls, word = _grade(score)
     s = "—" if score is None else f"{score}/100"
     return f'<span class="bf-pill {cls}">★ Quality {s} · {word}</span>'
+
+
+def quality_feedback_card(score, feedback: str) -> str:
+    if not feedback:
+        return ""
+    return (
+        '<div class="bf-quality-fb">'
+        f'<div class="bf-quality-fb-head">{quality_pill(score)}</div>'
+        f'<div class="bf-quality-fb-body">{html.escape(feedback)}</div>'
+        "</div>"
+    )
 
 
 def metrics(quality, revisions, words, seo_score) -> str:
@@ -222,6 +293,56 @@ def keyword_tags(keywords) -> str:
         return ""
     tags = "".join(f"<span>{html.escape(str(k))}</span>" for k in keywords)
     return f'<div class="bf-kw">{tags}</div>'
+
+
+def seo_card(seo_output: dict) -> str:
+    seo_output = seo_output or {}
+    report = seo_output.get("report") or {}
+    scls, _ = _grade(report.get("seo_score"))
+    score = report.get("seo_score")
+    score_html = (
+        f'<span class="bf-pill {scls}">🚀 SEO score {score}/100</span>' if score is not None else ""
+    )
+    meta = seo_output.get("meta_description") or ""
+    slug = seo_output.get("slug") or ""
+    recos = report.get("recommendations") or []
+    reco_html = (
+        "<ul class=\"bf-reco\">" + "".join(f"<li>{html.escape(str(r))}</li>" for r in recos) + "</ul>"
+        if recos else ""
+    )
+    return (
+        f'{keyword_tags(seo_output.get("keywords", []))}'
+        f'<div class="bf-seo-row">{score_html}</div>'
+        f'<div class="bf-seo-label">Meta description</div>'
+        f'<div class="bf-seo-meta">{html.escape(meta) if meta else "—"}</div>'
+        f'<div class="bf-seo-label">URL slug</div>'
+        f'<div><code class="bf-slug">{html.escape(slug) if slug else "—"}</code></div>'
+        f"{reco_html}"
+    )
+
+
+def usage_panel(tier: str, plan, model_display_name: str) -> str:
+    plan_label = "🆓 Free" if tier == "free" else "💳 Paid"
+    return (
+        '<div class="bf-usage">'
+        f'<div class="bf-usage-row"><span>Plan</span><b>{html.escape(plan_label)}</b></div>'
+        f'<div class="bf-usage-row"><span>Model</span><b>{html.escape(model_display_name)}</b></div>'
+        f'<div class="bf-usage-row"><span>Max draft attempts</span><b>{plan.max_drafts}</b></div>'
+        f'<div class="bf-usage-row"><span>Quality bar</span><b>{plan.quality_threshold}/100</b></div>'
+        "</div>"
+    )
+
+
+def sidebar_brand() -> str:
+    return (
+        '<div class="bf-brand bf-brand-side">'
+        '<span class="bf-logo">📝</span> BlogForge'
+        "</div>"
+    )
+
+
+def workflow_summary() -> str:
+    return " → ".join(label for _, label, _ in STEPS)
 
 
 def footer() -> str:

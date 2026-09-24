@@ -14,16 +14,21 @@ from nodes import (
     quality_check_node, human_review_node, publish_node,
 )
 
-# Tuning knobs
+# Fallback tuning knobs, used only when a run doesn't set plan-derived
+# state fields (e.g. direct graph.invoke() calls outside app.py, such as
+# the notebook). app.py normally seeds "quality_threshold"/"max_drafts"
+# from the active plan (see config/plans.py) into the initial state.
 QUALITY_THRESHOLD = 75   # minimum acceptable quality score
-MAX_DRAFTS = 2           # initial draft + 1 retry (keeps free-tier token use low)
+MAX_DRAFTS = 2           # initial draft + 1 retry
 
 
 def route_after_quality(state) -> str:
     """Conditional edge: loop back to draft on low quality, else go to human review."""
     score = state.get("quality_score", 0)
     revisions = state.get("revision_count", 0)
-    if score < QUALITY_THRESHOLD and revisions < MAX_DRAFTS:
+    threshold = state.get("quality_threshold", QUALITY_THRESHOLD)
+    max_drafts = state.get("max_drafts", MAX_DRAFTS)
+    if score < threshold and revisions < max_drafts:
         return "revise"
     return "review"
 

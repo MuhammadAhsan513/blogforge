@@ -1,43 +1,91 @@
-"""LLM factory for BlogForge.
+"""Provider-agnostic LLM facade for BlogForge.
 
-Uses Groq (https://console.groq.com) via langchain-groq. The default model
-`llama-3.3-70b-versatile` supports tool-calling, which `with_structured_output()`
-relies on for reliable Pydantic parsing.
+`nodes.py` never imports a provider SDK or a LangChain chat-model class
+directly — it only calls `invoke_structured()` below. Which provider
+actually handles the call is decided entirely by the `provider`/`model`
+arguments (sourced from `config["configurable"]`, ultimately from the
+Streamlit sidebar). Swapping providers, adding a new one, or changing
+retry/error behavior never requires touching `nodes.py` or `graph.py`.
 """
-import os
-from langchain_groq import ChatGroq
 
-DEFAULT_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
-# Lighter/faster fallback if the 70B model hits free-tier rate limits.
-FALLBACK_MODEL = "llama-3.1-8b-instant"
+import logging
+import time
+from typing import List, Optional, Tuple, Type, TypeVar
+
+from langchain_core.language_models.chat_models import BaseChatModel
+from pydantic import BaseModel
+
+from providers import get_provider_adapter
+from providers.errors import BlogForgeLLMError, MissingAPIKeyError
+
+logger = logging.getLogger("blogforge")
+
+_RETRY_BACKOFF_SECONDS = 1.5
+_RETRY_BACKOFF_CAP_SECONDS = 8.0
+
+ModelT = TypeVar("ModelT", bound=BaseModel)
 
 
-def get_llm(api_key: str | None = None, model: str | None = None, temperature: float = 0.4) -> ChatGroq:
-    """Return a configured ChatGroq client.
+def get_llm(provider: str, model: str, api_key: Optional[str], max_tokens: int) -> BaseChatModel:
+    """Return a configured LangChain chat model for the given provider/model.
 
-    The key can come from (in order): the explicit `api_key` arg, or the
-    GROQ_API_KEY environment variable (loaded from `.env`).
-
-    The model is resolved at call time from: the explicit `model` arg, the
-    GROQ_MODEL env var (which the Streamlit sidebar sets when you pick a model),
-    then the default.
-
-    `max_retries=0`: on a 429 rate-limit Groq returns Retry-After of several
-    minutes; the default client would silently sleep and retry, making the app
-    look frozen. We fail fast so the UI can show a clear message instead.
+    Raises MissingAPIKeyError if no API key was supplied.
     """
-    key = (api_key or os.getenv("GROQ_API_KEY") or "").strip()
+    key = (api_key or "").strip()
     if not key:
-        raise ValueError(
-            "No Groq API key found. Set GROQ_API_KEY in your .env file "
-            "(copy .env.example) or paste it in the Streamlit sidebar."
+        raise MissingAPIKeyError(
+            f"No API key was provided for {provider}. Enter one in the Streamlit sidebar."
         )
-    # ChatGroq reads GROQ_API_KEY from the environment; set it so we don't
-    # depend on constructor alias differences across langchain-groq versions.
-    os.environ["GROQ_API_KEY"] = key
-    model = model or os.getenv("GROQ_MODEL") or DEFAULT_MODEL
-    return ChatGroq(
-        model=model,
-        temperature=temperature,
-        max_retries=0,
+
+    adapter = get_provider_adapter(provider)
+    return adapter.build_chat_model(model_id=model, api_key=key, max_tokens=max_tokens)
+
+
+def invoke_structured(
+    model_cls: Type[ModelT],
+    messages: List[Tuple[str, str]],
+    *,
+    provider: str,
+    model: str,
+    api_key: Optional[str],
+    max_tokens: int,
+    max_retries: int = 1,
+) -> ModelT:
+    """Call the selected LLM with structured output and return a validated instance.
+
+    Retries are bounded by `max_retries` and only happen for retryable
+    normalized errors (rate limits, transient provider failures); every
+    other error is raised immediately. A provider's retry-after hint is
+    respected (capped) when present.
+    """
+    adapter = get_provider_adapter(provider)
+    llm = get_llm(provider=provider, model=model, api_key=api_key, max_tokens=max_tokens)
+    structured_llm = llm.with_structured_output(
+        model_cls, method=adapter.structured_output_method(model)
     )
+
+    attempt = 0
+    while True:
+        try:
+            result = structured_llm.invoke(messages)
+            if isinstance(result, dict):
+                return model_cls(**result)
+            return result
+        except BlogForgeLLMError:
+            raise
+        except Exception as exc:
+            normalized = adapter.normalize_error(exc)
+            logger.error(
+                "LLM call failed (provider=%s model=%s attempt=%d): %s",
+                provider,
+                model,
+                attempt + 1,
+                normalized.technical_detail,
+            )
+            attempt += 1
+            if not normalized.retryable or attempt > max_retries:
+                raise normalized from exc
+            delay = getattr(normalized, "retry_after", None) or (
+                _RETRY_BACKOFF_SECONDS * attempt
+            )
+            time.sleep(min(delay, _RETRY_BACKOFF_CAP_SECONDS))

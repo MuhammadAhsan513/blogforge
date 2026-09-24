@@ -1,8 +1,11 @@
 """Pydantic v2 models for structured LLM output (assignment requirement 7).
 
-Each blog-production node calls `llm.with_structured_output(Model)` so the LLM
-returns typed, validated objects instead of free text. Schemas are kept flat and
-well-described because Groq implements structured output via tool-calling.
+Each blog-production node calls `llm.invoke_structured(Model, ...)` so the LLM
+returns typed, validated objects instead of free text. Schemas are kept flat
+and well-described because most providers implement structured output via
+tool-calling or a JSON-schema mode, both of which work best with simple,
+descriptive field shapes (see `providers/*_provider.py` for the per-provider
+method choice).
 """
 from typing import List
 from pydantic import BaseModel, Field

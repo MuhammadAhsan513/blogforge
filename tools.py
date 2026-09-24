@@ -38,12 +38,15 @@ def run_web_search(query: str, max_results: int = 4) -> List[str]:
 
 
 @tool
-def web_search_tool(query: str) -> str:
+def web_search_tool(query: str, max_results: int = 4) -> str:
     """Search the web (DuckDuckGo) for recent, factual information about the query.
+
+    `max_results` lets callers scale search volume to the active usage
+    plan (see `config/plans.py`) without changing this tool's behavior.
 
     Returns newline-separated result snippets with source URLs.
     """
-    snippets = run_web_search(query)
+    snippets = run_web_search(query, max_results=max_results)
     return "\n".join(snippets) if snippets else "No results found."
 
 
